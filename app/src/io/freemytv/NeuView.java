@@ -14,9 +14,13 @@ import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
+import android.media.AudioManager;
 import android.media.tv.TvContract;
+import android.media.tv.TvInputInfo;
+import android.media.tv.TvInputManager;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.KeyEvent;
 import android.view.View;
@@ -24,24 +28,34 @@ import android.view.View;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
  * Bruno's home screen: a soft ("neumorphic") design in light, dark or automatic theme with an accent color, four tabs
- * (Início, Programação, Gerenciador, Ajustes) and the TV's own guide. Drawn by hand on one Canvas in a 1920×1080 frame
- * scaled to the screen (TCL's 1 GB models draw their UI at 1280×720). It only draws when something changes: no
- * animations, nothing running while another app is in front.
+ * (Início, Programação, Gerenciador, Ajustes). Drawn by hand on one Canvas in a 1920×1080 frame scaled to the screen
+ * (TCL's 1 GB models draw their UI at 1280×720). It only draws when something changes: no animations, nothing running
+ * while another app is in front.
+ *
+ * Focus moves by rows: every target belongs to a row, and rows to a group (the header, a side menu, the content).
+ * ← → walk the row; ↑ ↓ go to the next row in the same group, landing on the item last used there, else the one under.
  */
 final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     private static final float W = 1920, PAD = 96, TOP = 54, CONTENT_TOP = 170, CONTENT_BOTTOM = 1020;
-    private static final int HOME = 0, GUIDE = 1, TASKS = 2, SETTINGS = 3, ALL_APPS = 4;
+    private static final int HOME = 0, GUIDE = 1, TASKS = 2, SETTINGS = 3, ALL_APPS = 4, WEATHER = 5;
     private static final String[] TAB_NAMES = {"Início", "Programação", "Gerenciador", "Ajustes"};
     private static final long GUIDE_SPAN_MIN = 180;
-    private static final int GUIDE_ROWS = 6;
+    private static final int GUIDE_ROWS = 6, APP_COLS = 6, APP_ROWS = 4;
+    private static final long VOLUME_CLOSE_MS = 5_000, AUTO_FREE_EVERY = 10 * 60_000L;
+    private static final int[] SLEEP_STEPS = {30, 60, 120};
 
     private final Activity activity;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -51,28 +65,34 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     private final Recs recs;
     private final Click click;
     private final SharedPreferences prefs;
+    private final AudioManager audio;
 
     // State
     private int screen = HOME, sub;
     private String theme;
     private int accent;
-    private boolean showWeather, showSystem, showReleases, darkNow;
-    private List<HomeApps.Item> shelf = new ArrayList<>();
+    private boolean showWeather, showSystem, showReleases, autoFree, darkNow;
+    private List<HomeApps.Item> shelf = new ArrayList<>(), inputs = new ArrayList<>();
     private List<Recs.Pick> picks = new ArrayList<>();
     private List<String[]> allApps = new ArrayList<>();
-    private final java.util.Map<String, Drawable> icons = new java.util.HashMap<>();
+    private final Map<String, Drawable> icons = new HashMap<>();
+    private final Set<String> hidden;
+    private boolean editHidden;
     private Guide.Result guide;
-    private boolean guideLoading, guideAsked;
-    private long guideFrom;
+    private boolean guideLoading, guideFromTv;
+    private long guideFrom, guideAt;
     private int guideTop;
     private Guide.Program guideSel;
-    private String guideSelChannel = "";
+    private Guide.Channel guideSelChannel;
     private Tasks.Memory mem;
     private List<Tasks.App> taskApps;
     private boolean tasksLoading;
     private String tasksError;
+    private long autoFreeAt;
     private int allTop, allMaxTop;
-    private boolean running;
+    private boolean running, warmed;
+    private int volume, volumeMax = 1;
+    private boolean volumeOpen, muted;
 
     // Modal confirm and toast
     private String cTitle, cBody, cOk;
@@ -83,10 +103,11 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     private String clock = "", date = "";
     private final SimpleDateFormat hhmm = new SimpleDateFormat("HH:mm", Locale.forLanguageTag("pt-BR"));
     private final SimpleDateFormat longDate = new SimpleDateFormat("EEEE, d 'de' MMMM", Locale.forLanguageTag("pt-BR"));
+    private final SimpleDateFormat weekday = new SimpleDateFormat("EEE", Locale.forLanguageTag("pt-BR"));
 
     // Focus targets, rebuilt on every pass (pooled)
     private static final class Target {
-        String key;
+        String key, row, group;
         final RectF r = new RectF();
         float radius;
         Runnable action;
@@ -98,14 +119,19 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     private boolean focusFirst = true, modal, inModal;
     private float pendingX = -1;
     private int pendingDir;
+    private final Map<String, String> rowMemory = new HashMap<>(), groupMemory = new HashMap<>();
+    private final Map<Integer, String> screenMemory = new HashMap<>();
+    private int lastKey;
+    private long lastKeyAt;
 
     // Paints and scratch
     private final Paint tp = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint bmp = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
-    private final RectF r1 = new RectF(), r2 = new RectF(), r3 = new RectF();
+    private final RectF r1 = new RectF(), r2 = new RectF(), r3 = new RectF(), r4 = new RectF();
     private final Path path = new Path();
+    private final float[] tabWidths = new float[4];
     private float scale = 1;
 
     NeuView(Activity a) {
@@ -114,17 +140,21 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         data = HomeData.get(a);
         recs = Recs.get(a);
         click = new Click(a);
+        audio = a.getSystemService(AudioManager.class);
         prefs = a.getSharedPreferences("neu", Context.MODE_PRIVATE);
         theme = prefs.getString("theme", "auto");
         accent = prefs.getInt("accent", Neu.ACCENTS[0]);
         showWeather = prefs.getBoolean("weather", true);
         showSystem = prefs.getBoolean("system", true);
         showReleases = prefs.getBoolean("releases", true);
+        autoFree = prefs.getBoolean("autofree", false);
+        hidden = new HashSet<>(prefs.getStringSet("hidden", new HashSet<>()));
         stroke.setStyle(Paint.Style.STROKE);
         setFocusable(true);
         setFocusableInTouchMode(true);
         recs.setLight(true);
-        shelf = HomeApps.shelf(a, false);
+        shelf = byUse(HomeApps.shelf(a, false));
+        inputs = readInputs(a);
         mem = Tasks.memory(a);
         updateClock();
         updateTheme();
@@ -145,11 +175,13 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         updateTheme();
         final Context c = getContext().getApplicationContext();
         io.execute(() -> {
-            final List<HomeApps.Item> s = HomeApps.shelf(c, true);
-            handler.post(() -> { shelf = s; invalidate(); });
+            final List<HomeApps.Item> s = byUse(HomeApps.shelf(c, true));
+            final List<HomeApps.Item> in = readInputs(c);
+            handler.post(() -> { shelf = s; inputs = in; invalidate(); });
         });
-        if (screen == GUIDE) loadGuide();
+        loadGuide(false);   // the guide on file (or a new one after 8 h): "no ar" on the TV card
         if (screen == TASKS) loadTasks();
+        maybeFreeMemory();
         handler.removeCallbacks(tick);
         handler.postDelayed(tick, 60_000 - System.currentTimeMillis() % 60_000);
         requestFocus();
@@ -159,6 +191,8 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     void pause() {
         running = false;
         handler.removeCallbacks(tick);
+        handler.removeCallbacks(closeVolume);
+        volumeOpen = false;
         data.removeListener(this);
         recs.removeListener(this);
     }
@@ -171,18 +205,19 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     /** The Home button on the home screen: back to Início, focus on TV ao vivo. */
     void reset() {
         closeConfirm();
+        volumeOpen = false;
+        editHidden = false;
         screen = HOME;
         focusFirst = true;
         invalidate();
     }
 
     void showAllApps() {
-        openAllApps();
+        openAllApps(false);
     }
 
     void permissionsResult() {
-        guideAsked = true;
-        loadGuide();
+        loadGuide(true);
     }
 
     private final Runnable tick = new Runnable() {
@@ -194,6 +229,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             recs.refreshIfStale();
             mem = Tasks.memory(getContext());
             updatePicks();
+            if (System.currentTimeMillis() - guideAt > NetGuide.KEEP_MS) loadGuide(false);
             invalidate();
             handler.postDelayed(this, 60_000 - System.currentTimeMillis() % 60_000);
         }
@@ -234,6 +270,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             darkNow = dark;
             neu.apply(dark, accent);
             neu.clear();
+            warmed = false;
             activity.getWindow().setStatusBarColor(neu.bg);
         }
     }
@@ -243,14 +280,45 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             picks = new ArrayList<>();
             return;
         }
-        List<Recs.Pick> all = recs.wanted(), out = new ArrayList<>();
-        for (Recs.Pick p : all) {
+        List<Recs.Pick> out = new ArrayList<>();
+        for (Recs.Pick p : recs.wanted()) {
             if (p.pkg == null) continue;
             out.add(p);
             recs.backdrop(p);   // builds the poster in the background (light design) and tells us when it's ready
             if (out.size() == 5) break;
         }
         picks = out;
+    }
+
+    /** The shelf in order of real use (how many times each app was opened from here), ties as they came. */
+    private List<HomeApps.Item> byUse(List<HomeApps.Item> list) {
+        List<HomeApps.Item> out = new ArrayList<>(list);
+        final Map<String, Integer> uses = new HashMap<>();
+        for (HomeApps.Item it : out) uses.put(it.pkg, prefs.getInt("use:" + it.pkg, 0));
+        Collections.sort(out, (a, b) -> Integer.compare(uses.get(b.pkg), uses.get(a.pkg)));
+        return out;
+    }
+
+    /** HDMI and AV inputs (all of them: TCL reports every port as "standby", device or not). */
+    private static List<HomeApps.Item> readInputs(Context c) {
+        List<HomeApps.Item> out = new ArrayList<>();
+        for (HomeApps.Item it : HomeApps.allInputs(c)) if (it.kind == HomeApps.INPUT) out.add(it);
+        TvInputManager tim = (TvInputManager) c.getSystemService(Context.TV_INPUT_SERVICE);
+        try {
+            if (tim != null) for (TvInputInfo info : tim.getTvInputList()) {
+                if (info.getType() != TvInputInfo.TYPE_COMPOSITE || info.getParentId() != null) continue;
+                HomeApps.Item it = new HomeApps.Item();
+                it.kind = HomeApps.INPUT;
+                it.key = "av";
+                it.label = "AV";
+                it.inputId = info.getId();
+                it.number = "0";
+                out.add(it);
+                break;
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return out;
     }
 
     // MARK: - Drawing
@@ -268,12 +336,43 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         pass(c);
         drawFocus(c);
         c.restore();
+        if (!warmed) {
+            warmed = true;
+            handler.postDelayed(this::warm, 400);
+        }
+    }
+
+    /**
+     * Builds every screen's shadows ahead, one screen per message, on a tiny canvas (only the masks matter): the first
+     * visit to a tab then costs no more than the next ones.
+     */
+    private void warm() {
+        final int[] screens = {SETTINGS, TASKS, GUIDE, WEATHER, ALL_APPS};
+        final Canvas tiny = new Canvas(Bitmap.createBitmap(2, 2, Bitmap.Config.ALPHA_8));
+        for (int i = 0; i < screens.length; i++) {
+            final int s = screens[i];
+            handler.postDelayed(() -> {
+                if (!running || cTitle != null || volumeOpen || screen == s) return;
+                int was = screen, wasSub = sub;
+                for (int k = 0; k < (s == SETTINGS ? 3 : 1); k++) {
+                    screen = s;
+                    sub = k;
+                    pass(tiny);
+                }
+                screen = was;
+                sub = wasSub;
+                pass(null);   // the targets of the screen in view again
+            }, 120L * i);
+        }
     }
 
     private boolean hasFocusKey() {
-        if (focusKey == null) return false;
-        for (int i = 0; i < count; i++) if (focusKey.equals(pool.get(i).key)) return true;
-        return false;
+        return focused() != null;
+    }
+
+    /** Rows of the lists that scroll: the guide's channels and all the apps. */
+    private static boolean scrolls(Target t) {
+        return t.row.startsWith("g") || t.row.startsWith("aa") && !t.row.equals("aa-top");
     }
 
     private void resolveFocus() {
@@ -283,23 +382,24 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             float bestD = Float.MAX_VALUE, edge = pendingDir > 0 ? -Float.MAX_VALUE : Float.MAX_VALUE;
             for (int i = 0; i < count; i++) {
                 Target t = pool.get(i);
-                if (t.key == null || !t.key.startsWith("g:") && !t.key.startsWith("a:")) continue;
+                if (!scrolls(t)) continue;
                 edge = pendingDir > 0 ? Math.max(edge, t.r.centerY()) : Math.min(edge, t.r.centerY());
             }
             for (int i = 0; i < count; i++) {
                 Target t = pool.get(i);
-                if (t.key == null || Math.abs(t.r.centerY() - edge) > 1) continue;
+                if (!scrolls(t) || Math.abs(t.r.centerY() - edge) > 1) continue;
                 float d = Math.abs(Math.max(t.r.left, Math.min(pendingX, t.r.right)) - pendingX);
                 if (d < bestD) { bestD = d; best = t; }
             }
             pendingDir = 0;
-            if (best != null) { focusKey = best.key; focusFirst = false; return; }
+            if (best != null) { setFocus(best); focusFirst = false; return; }
         }
         if (focusFirst || !hasFocusKey()) {
             Target first = null;
             for (int i = 0; i < count; i++) if (pool.get(i).first) { first = pool.get(i); break; }
+            if (first == null) for (int i = 0; i < count; i++) if (!"hdr".equals(pool.get(i).group)) { first = pool.get(i); break; }
             if (first == null && count > 0) first = pool.get(0);
-            focusKey = first == null ? null : first.key;
+            if (first != null) setFocus(first); else focusKey = null;
             focusFirst = false;
         }
     }
@@ -307,7 +407,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     /** Lays out (and, with a canvas, draws) the whole screen; registers the focus targets on the way. */
     private void pass(Canvas c) {
         count = 0;
-        modal = cTitle != null;
+        modal = cTitle != null || volumeOpen;
         inModal = false;
         header(c);
         switch (screen) {
@@ -315,21 +415,23 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             case TASKS: tasksScreen(c); break;
             case SETTINGS: settingsScreen(c); break;
             case ALL_APPS: allAppsScreen(c); break;
+            case WEATHER: weatherScreen(c); break;
             default: homeScreen(c); break;
         }
         text(c, "Setas navegam  ·  OK abre  ·  Voltar retorna", W / 2, 1062, 22, Ui.regular, neu.muted, 1);
         if (toast != null && c != null) {
             tp.setTypeface(Ui.semibold);
             tp.setTextSize(26);
-            float w = tp.measureText(toast) + 120;
+            float w = Math.min(1500, tp.measureText(toast) + 120);
             r1.set(W / 2 - w / 2, 940, W / 2 + w / 2, 1024);
             neu.raised(c, r1, 42, Neu.RAISED, 0);
             fill.setColor(neu.accent);
             c.drawCircle(r1.left + 42, r1.centerY(), 22, fill);
             check(c, r1.left + 42, r1.centerY(), 12, neu.onAccent);
-            text(c, toast, r1.left + 82, r1.centerY() + 9, 26, Ui.semibold, neu.text, 0);
+            text(c, ellipsize(toast, w - 110, 26, Ui.semibold), r1.left + 82, r1.centerY() + 9, 26, Ui.semibold, neu.text, 0);
         }
-        if (modal) confirmDialog(c);
+        if (volumeOpen) volumePanel(c);
+        if (cTitle != null) confirmDialog(c);
     }
 
     // MARK: Header
@@ -337,22 +439,20 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     private void header(Canvas c) {
         text(c, clock, PAD, TOP + 50, 56, Ui.displaySemibold, neu.text, 0);
         text(c, date, PAD, TOP + 86, 24, Ui.regular, neu.muted, 0);
-        // Tabs
         tp.setTypeface(Ui.semibold);
         tp.setTextSize(26);
-        float[] widths = new float[4];
         float total = 20 + 12 * 3;
         for (int i = 0; i < 4; i++) {
-            widths[i] = tp.measureText(TAB_NAMES[i]) + 52 + 40;
-            total += widths[i];
+            tabWidths[i] = tp.measureText(TAB_NAMES[i]) + 52 + 40;
+            total += tabWidths[i];
         }
         float x = W / 2 - total / 2;
         r1.set(x, TOP + 2, x + total, TOP + 86);
         if (c != null) neu.inset(c, r1, 42, neu.bg);
         x += 10;
-        int current = screen == ALL_APPS ? HOME : screen;
+        int current = screen == ALL_APPS || screen == WEATHER ? HOME : screen;
         for (int i = 0; i < 4; i++) {
-            r2.set(x, TOP + 12, x + widths[i], TOP + 76);
+            r2.set(x, TOP + 12, x + tabWidths[i], TOP + 76);
             final int tab = i;
             boolean on = current == i;
             if (c != null) {
@@ -361,16 +461,22 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
                 tabIcon(c, i, r2.left + 26 + 14, r2.centerY(), col);
                 text(c, TAB_NAMES[i], r2.left + 26 + 40, r2.centerY() + 9, 26, Ui.semibold, col, 0);
             }
-            target("tab" + i, r2, 32, () -> openTab(tab), false);
-            x += widths[i] + 12;
+            target("tab" + i, "hdr", r2, 32, () -> openTab(tab), false);
+            x += tabWidths[i] + 12;
         }
-        // TV settings, top right
+        // Volume and the TV's settings, top right
+        r2.set(W - PAD - 64 - 24 - 64, TOP + 12, W - PAD - 64 - 24, TOP + 76);
+        if (c != null) {
+            neu.raised(c, r2, 32, Neu.RAISED_SMALL, 0);
+            speaker(c, r2.centerX(), r2.centerY(), neu.text, muted);
+        }
+        target("volume", "hdr", r2, 32, this::openVolume, false);
         r2.set(W - PAD - 64, TOP + 12, W - PAD, TOP + 76);
         if (c != null) {
             neu.raised(c, r2, 32, Neu.RAISED_SMALL, 0);
             Symbols.draw(getContext(), c, "settings", r2.centerX(), r2.centerY(), 30, neu.text);
         }
-        target("gear", r2, 32, this::openTvSettings, false);
+        target("gear", "hdr", r2, 32, this::openTvSettings, false);
     }
 
     private void tabIcon(Canvas c, int i, float cx, float cy, int color) {
@@ -402,35 +508,54 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         float tvRight = right;
         if (showSystem) tvRight -= 480 + 24;
         if (showWeather) tvRight -= 440 + 24;
-        // TV ao vivo
+        // TV ao vivo: the picture area opens the antenna, the chips below it the inputs
         r1.set(PAD, top, tvRight, top + h);
+        if (c != null) neu.raised(c, r1, 32, Neu.RAISED, 0);
+        r4.set(r1.left + 20, r1.top + 20, r1.right - 20, r1.bottom - 104);
         if (c != null) {
-            neu.raised(c, r1, 32, Neu.RAISED, 0);
-            r2.set(r1.left + 20, r1.top + 20, r1.right - 20, r1.bottom - 92);
             fill.setColor(0xFF101317);
-            c.drawRoundRect(r2, 20, 20, fill);
-            r3.set(r2.left + 18, r2.top + 18, r2.left + 150, r2.top + 58);
+            c.drawRoundRect(r4, 20, 20, fill);
+            r3.set(r4.left + 18, r4.top + 18, r4.left + 150, r4.top + 58);
             fill.setColor(0xFFD92D20);
             c.drawRoundRect(r3, 20, 20, fill);
             text(c, "AO VIVO", r3.centerX(), r3.centerY() + 9, 24, Ui.semibold, 0xFFFFFFFF, 1);
             fill.setColor(neu.accent);
-            c.drawCircle(r2.centerX(), r2.centerY(), 48, fill);
-            play(c, r2.centerX() + 4, r2.centerY(), 22, neu.onAccent);
-            text(c, "TV ao vivo", r1.left + 28, r1.bottom - 50, 32, Ui.semibold, neu.text, 0);
-            text(c, "Canais da antena", r1.left + 28, r1.bottom - 18, 24, Ui.regular, neu.muted, 0);
-            text(c, "OK para assistir", r1.right - 28, r1.bottom - 18, 24, Ui.regular, neu.muted, 2);
+            c.drawCircle(r4.left + 64, r4.bottom - 56, 36, fill);
+            play(c, r4.left + 67, r4.bottom - 56, 16, neu.onAccent);
+            String ch = prefs.getString("lastCh", "12.1");
+            Guide.Program now = onAirNow(ch);
+            text(c, "TV ao vivo  ·  Canal " + ch, r4.left + 118, r4.bottom - 66, 28, Ui.semibold, 0xFFFFFFFF, 0);
+            text(c, ellipsize(now == null ? "OK para assistir" : "No ar: " + now.title, r4.width() - 140, 24, Ui.regular),
+                    r4.left + 118, r4.bottom - 32, 24, Ui.regular, 0xFFB8C0CC, 0);
         }
-        target("tv", r1, 32, this::openLiveTv, true);
+        target("tv", "top", r4, 20, this::openLiveTv, true);
+        // Inputs
+        float cx = r1.left + 20;
+        for (final HomeApps.Item it : inputs) {
+            String label = ellipsize(it.label, 150, 24, Ui.semibold);
+            tp.setTypeface(Ui.semibold);
+            tp.setTextSize(24);
+            float w = tp.measureText(label) + 48;
+            if (cx + w > r1.right - 20) break;
+            r2.set(cx, r1.bottom - 80, cx + w, r1.bottom - 24);
+            if (c != null) {
+                neu.raised(c, r2, 28, Neu.RAISED_SMALL, 0);
+                text(c, label, r2.centerX(), r2.centerY() + 9, 24, Ui.semibold, neu.text, 1);
+            }
+            target("in:" + it.key, "tvin", r2, 28, () -> openItem(it), false);
+            cx += w + 16;
+        }
         float x = tvRight + 24;
         if (showWeather) {
             r1.set(x, top, x + 440, top + h);
             if (c != null) weatherCard(c, r1);
+            target("wx", "top", r1, 32, () -> openScreen(WEATHER), false);
             x += 440 + 24;
         }
         if (showSystem) {
             r1.set(x, top, x + 480, top + h);
             if (c != null) systemCard(c, r1);
-            target("sys", r1, 32, () -> openTab(TASKS), false);
+            target("sys", "top", r1, 32, () -> openTab(TASKS), false);
         }
         // Mais usados
         float y = top + h + 28;
@@ -442,7 +567,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             final HomeApps.Item it = shelf.get(i);
             r1.set(PAD + i * (colW + 24), y, PAD + i * (colW + 24) + colW, y + 150);
             if (c != null) appTile(c, r1, it);
-            target("app:" + it.pkg, r1, 28, () -> openItem(it), false);
+            target("app:" + it.pkg, "apps", r1, 28, () -> openItem(it), false);
         }
         r1.set(PAD + 6 * (colW + 24), y, W - PAD, y + 150);
         if (c != null) {
@@ -452,7 +577,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             Symbols.draw(getContext(), c, "apps", r2.centerX(), r2.centerY(), 30, neu.text);
             text(c, "Todos os apps", r1.centerX(), r1.bottom - 24, 24, Ui.semibold, neu.text, 1);
         }
-        target("allapps", r1, 28, this::openAllApps, false);
+        target("allapps", "apps", r1, 28, () -> openAllApps(false), false);
         // Últimos lançamentos
         if (!showReleases) return;
         y += 150 + 28;
@@ -468,7 +593,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
                 text(c, "Falta a chave gratuita do TMDB para mostrar os lançamentos.", PAD + 36, y + 80, 28, Ui.semibold, neu.text, 0);
                 text(c, "OK para abrir os ajustes e colar a chave pelo celular (QR Code).", PAD + 36, y + 124, 24, Ui.regular, neu.muted, 0);
             }
-            target("tmdb", r1, 24, this::openFreeMyTvSettings, false);
+            target("tmdb", "rel", r1, 24, this::openFreeMyTvSettings, false);
             return;
         }
         float cw = (W - 2 * PAD - 4 * 24) / 5f;
@@ -476,8 +601,18 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             r1.set(PAD + i * (cw + 24), y, PAD + i * (cw + 24) + cw, y + 184);
             final Recs.Pick p = i < picks.size() ? picks.get(i) : null;
             if (c != null) releaseCard(c, r1, p);
-            if (p != null) target("pick:" + Recs.key(p), r1, 24, () -> openPick(p), false);
+            if (p != null) target("pick:" + Recs.key(p), "rel", r1, 24, () -> openPick(p), false);
         }
+    }
+
+    private Guide.Program onAirNow(String number) {
+        if (guide == null) return null;
+        long now = System.currentTimeMillis();
+        for (Guide.Channel ch : guide.channels) {
+            if (!ch.number.equals(number)) continue;
+            for (Guide.Program p : ch.programs) if (p.start <= now && now < p.end) return p;
+        }
+        return null;
     }
 
     private void weatherCard(Canvas c, RectF r) {
@@ -556,52 +691,107 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             y += 32;
         }
         text(c, ellipsize(Recs.serviceName(p), tw, 22, Ui.regular), tx, r.bottom - 52, 22, Ui.regular, neu.muted, 0);
-        text(c, ellipsize("movie".equals(p.kind) ? "Filme" : "Série", tw, 22, Ui.regular), tx, r.bottom - 22, 22, Ui.regular, neu.muted, 0);
+        text(c, "movie".equals(p.kind) ? "Filme" : "Série", tx, r.bottom - 22, 22, Ui.regular, neu.muted, 0);
+    }
+
+    // MARK: Previsão do tempo
+
+    private void weatherScreen(Canvas c) {
+        HomeData.Weather wx = data.weather;
+        boolean ready = wx != null && !Double.isNaN(wx.temp);
+        String title = Config.CITY.isEmpty() ? "Previsão do tempo" : "Previsão do tempo em " + Config.CITY;
+        r1.set(PAD, CONTENT_TOP, W - PAD, CONTENT_TOP + 300);
+        if (c != null) neu.raised(c, r1, 32, Neu.RAISED, 0);
+        if (!ready) {
+            text(c, "Carregando a previsão…", r1.left + 40, r1.top + 80, 30, Ui.semibold, neu.text, 0);
+        } else if (c != null) {
+            text(c, title, r1.left + 40, r1.top + 60, 30, Ui.semibold, neu.text, 0);
+            Symbols.draw(getContext(), c, Symbols.weather(wx.code, wx.isDay), r1.left + 110, r1.top + 175, 96, neu.accent);
+            text(c, HomeData.degrees(wx.temp), r1.left + 200, r1.top + 205, 110, Ui.displaySemibold, neu.text, 0);
+            text(c, HomeData.condition(wx.code, wx.isDay), r1.left + 480, r1.top + 160, 32, Ui.semibold, neu.text, 0);
+            text(c, HomeData.highLow(wx, "  "), r1.left + 480, r1.top + 204, 26, Ui.regular, neu.muted, 0);
+            if (wx.sunrise > 0) {
+                text(c, "Nascer do sol " + hhmm.format(new Date(wx.sunrise)) + "   ·   Pôr do sol " + hhmm.format(new Date(wx.sunset)),
+                        r1.right - 40, r1.top + 60, 24, Ui.regular, neu.muted, 2);
+            }
+            // The next 8 hours
+            int n = Math.min(8, wx.hours.size());
+            float cw = 110, gx = r1.right - 40 - n * cw - (n - 1) * 12;
+            for (int i = 0; i < n; i++) {
+                r2.set(gx + i * (cw + 12), r1.top + 110, gx + i * (cw + 12) + cw, r1.bottom - 40);
+                neu.inset(c, r2, 18, neu.bg);
+                text(c, HomeData.hour(wx.hours.get(i)), r2.centerX(), r2.top + 36, 22, Ui.regular, neu.muted, 1);
+                Symbols.draw(getContext(), c, Symbols.weather(wx.hourCode.get(i), wx.hourDay.get(i)), r2.centerX(), r2.centerY() + 2, 32, neu.text);
+                text(c, HomeData.degrees(wx.hourTemp.get(i)), r2.centerX(), r2.bottom - 22, 26, Ui.semibold, neu.text, 1);
+            }
+        }
+        // The next 5 days
+        float y = CONTENT_TOP + 300 + 32;
+        int n = ready ? Math.min(5, wx.days.size()) : 0;
+        float dw = (W - 2 * PAD - 4 * 24) / 5f;
+        for (int i = 0; i < n; i++) {
+            r1.set(PAD + i * (dw + 24), y, PAD + i * (dw + 24) + dw, y + 300);
+            if (c != null) {
+                neu.raised(c, r1, 28, Neu.RAISED_SMALL, 0);
+                String d = weekday.format(new Date(wx.days.get(i))).replace(".", "");
+                text(c, d.isEmpty() ? d : Character.toUpperCase(d.charAt(0)) + d.substring(1), r1.centerX(), r1.top + 56, 28, Ui.semibold, neu.text, 1);
+                Symbols.draw(getContext(), c, Symbols.weather(wx.dayCode.get(i), true), r1.centerX(), r1.top + 140, 64, neu.accent);
+                text(c, HomeData.degrees(wx.dayMax.get(i)), r1.centerX(), r1.top + 226, 36, Ui.displaySemibold, neu.text, 1);
+                text(c, "mín " + HomeData.degrees(wx.dayMin.get(i)), r1.centerX(), r1.top + 266, 24, Ui.regular, neu.muted, 1);
+            }
+            target("day" + i, "days", r1, 28, null, i == 0);
+        }
+        if (n == 0) {
+            r1.set(PAD, y, PAD + 320, y + 80);
+            if (c != null) {
+                neu.raised(c, r1, 28, Neu.RAISED_SMALL, 0);
+                text(c, "Voltar", r1.centerX(), r1.centerY() + 9, 26, Ui.semibold, neu.text, 1);
+            }
+            target("wxback", "days", r1, 28, () -> openScreen(HOME), true);
+        }
     }
 
     // MARK: Programação
 
     private void guideScreen(Canvas c) {
-        if (!Guide.allowed(getContext())) {
-            message(c, "A grade vem do sinal da antena",
-                    "Para ler a programação, a TV precisa deixar esta tela acessar o guia de canais.",
-                    guideAsked ? "Permitir de novo" : "Permitir acesso ao guia", this::askGuide);
-            return;
-        }
-        if (guide == null || guideLoading) {
-            message(c, "Lendo o guia da TV…", "Isso leva só alguns segundos.", null, null);
+        if (guide == null || guideLoading && guide.channels.isEmpty()) {
+            message(c, "Buscando a programação…", "A grade vem da internet e fica guardada por 8 horas.", null, null);
             return;
         }
         if (guide.channels.isEmpty()) {
-            message(c, "A TV não compartilhou os canais",
-                    "O guia da antena não apareceu para outros apps. Na próxima versão, a grade vem da internet.",
-                    "Abrir TV ao vivo", this::openLiveTv);
+            message(c, "Não consegui baixar a grade",
+                    "Confira se a TV está conectada à internet e tente de novo.",
+                    "Tentar de novo", () -> loadGuide(true));
             return;
         }
         long now = System.currentTimeMillis();
-        float labelW = 200, gx = PAD + labelW + 20, gw = W - PAD - gx;
+        float labelW = 220, gx = PAD + labelW + 20, gw = W - PAD - gx;
         float pxPerMin = gw / GUIDE_SPAN_MIN;
         // Selected program bar
         r1.set(PAD, CONTENT_TOP, W - PAD, CONTENT_TOP + 112);
         if (c != null) {
             neu.raised(c, r1, 28, Neu.RAISED, 0);
             Guide.Program sel = guideSel;
-            if (sel != null) {
+            if (sel != null && guideSelChannel != null) {
                 boolean onAir = sel.start <= now && now < sel.end;
-                text(c, ellipsize(sel.title.isEmpty() ? "Sem informação" : sel.title, 1100, 34, Ui.semibold), r1.left + 32, r1.top + 50, 34, Ui.semibold, neu.text, 0);
-                text(c, "Canal " + guideSelChannel + "  ·  " + hhmm.format(new Date(sel.start)) + " – " + hhmm.format(new Date(sel.end)), r1.left + 32, r1.top + 88, 24, Ui.regular, neu.muted, 0);
-                String chip = onAir ? "No ar agora" : "Começa às " + hhmm.format(new Date(sel.start));
+                boolean reminded = !onAir && Reminders.has(getContext(), guideSelChannel, sel);
+                text(c, ellipsize(sel.title.isEmpty() ? "Sem informação" : sel.title, 1000, 34, Ui.semibold), r1.left + 32, r1.top + 50, 34, Ui.semibold, neu.text, 0);
+                text(c, ellipsize(guideSelChannel.name + "  ·  Canal " + guideSelChannel.number + "  ·  " + hhmm.format(new Date(sel.start))
+                        + " – " + hhmm.format(new Date(sel.end))
+                        + (onAir ? "  ·  OK para assistir" : reminded ? "  ·  OK tira o lembrete" : "  ·  OK para lembrar"), 1250, 24, Ui.regular),
+                        r1.left + 32, r1.top + 88, 24, Ui.regular, neu.muted, 0);
+                String chip = onAir ? "No ar agora" : reminded ? "Lembrete às " + hhmm.format(new Date(sel.start - 60_000L)) : "Começa às " + hhmm.format(new Date(sel.start));
                 tp.setTypeface(Ui.semibold);
                 tp.setTextSize(24);
                 float cw = tp.measureText(chip) + 44;
                 r2.set(r1.right - 32 - cw, r1.centerY() - 24, r1.right - 32, r1.centerY() + 24);
-                if (onAir) {
+                if (onAir || reminded) {
                     fill.setColor(neu.accent);
                     c.drawRoundRect(r2, 24, 24, fill);
                 } else {
                     neu.inset(c, r2, 24, neu.bg);
                 }
-                text(c, chip, r2.centerX(), r2.centerY() + 9, 24, Ui.semibold, onAir ? neu.onAccent : neu.text, 1);
+                text(c, chip, r2.centerX(), r2.centerY() + 9, 24, Ui.semibold, onAir || reminded ? neu.onAccent : neu.text, 1);
             } else {
                 text(c, "Escolha um programa", r1.left + 32, r1.top + 66, 30, Ui.semibold, neu.text, 0);
             }
@@ -625,25 +815,22 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         guideTop = Math.max(0, Math.min(guideTop, chs.size() - GUIDE_ROWS));
         boolean firstSet = false;
         for (int row = guideTop; row < Math.min(chs.size(), guideTop + GUIDE_ROWS); row++) {
-            Guide.Channel ch = chs.get(row);
+            final Guide.Channel ch = chs.get(row);
             r1.set(PAD, y, PAD + labelW, y + 96);
             if (c != null) {
                 neu.raised(c, r1, 20, Neu.RAISED_SMALL, 0);
-                text(c, ch.number.isEmpty() ? "Canal" : "Canal " + ch.number, r1.left + 22, r1.top + 40, 22, Ui.regular, neu.muted, 0);
-                text(c, ellipsize(ch.name, labelW - 40, 26, Ui.semibold), r1.left + 22, r1.top + 74, 26, Ui.semibold, neu.text, 0);
+                text(c, "Canal " + ch.number, r1.left + 22, r1.top + 38, 22, Ui.regular, neu.muted, 0);
+                text(c, ellipsize(ch.name, labelW - 40, 26, Ui.semibold), r1.left + 22, r1.top + 72, 26, Ui.semibold, neu.text, 0);
             }
             r2.set(gx, y, gx + gw, y + 96);
             if (c != null) neu.inset(c, r2, 20, 0);
-            if (ch.programs.isEmpty()) {
-                r3.set(gx + 4, y + 8, gx + gw - 4, y + 88);
-                if (c != null) text(c, "Sem informação de programação", r3.left + 20, r3.centerY() + 9, 24, Ui.regular, neu.muted, 0);
-                final Guide.Channel fch = ch;
-                target("g:" + row + ":x", r3, 14, () -> openChannel(fch), false);
-            }
+            String rowId = "g" + row;
+            boolean any = false;
             for (int pi = 0; pi < ch.programs.size(); pi++) {
                 final Guide.Program p = ch.programs.get(pi);
                 float a = Math.max(0, (p.start - guideFrom) / 60_000f), b = Math.min(GUIDE_SPAN_MIN, (p.end - guideFrom) / 60_000f);
                 if (b <= 0 || a >= GUIDE_SPAN_MIN) continue;
+                any = true;
                 r3.set(gx + a * pxPerMin + 4, y + 8, gx + Math.max(a * pxPerMin + 40, b * pxPerMin - 4), y + 88);
                 boolean onAir = p.start <= now && now < p.end;
                 if (c != null) {
@@ -651,24 +838,31 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
                         fill.setColor(neu.bg);
                         c.drawRoundRect(r3, 14, 14, fill);
                     }
+                    boolean bell = !onAir && Reminders.has(getContext(), ch, p);
                     c.save();
                     c.clipRect(r3);
-                    text(c, ellipsize(p.title, r3.width() - 32, 24, Ui.semibold), r3.left + 16, r3.top + 36, 24, Ui.semibold, neu.text, 0);
+                    float tx = r3.left + 16;
+                    if (bell) {
+                        Symbols.draw(getContext(), c, "bell", tx + 12, r3.top + 28, 22, neu.accent);
+                        tx += 32;
+                    }
+                    text(c, ellipsize(p.title, r3.right - tx - 16, 24, Ui.semibold), tx, r3.top + 36, 24, Ui.semibold, neu.text, 0);
                     text(c, hhmm.format(new Date(p.start)) + " – " + hhmm.format(new Date(p.end)), r3.left + 16, r3.top + 68, 22, Ui.regular, neu.muted, 0);
                     c.restore();
                 }
-                final Guide.Channel fch = ch;
                 boolean first = onAir && !firstSet;
                 if (first) firstSet = true;
-                Target t = target("g:" + row + ":" + pi, r3, 14, () -> {
-                    if (p.start <= System.currentTimeMillis() && System.currentTimeMillis() < p.end) openChannel(fch);
-                    else showToast(ellipsize(p.title, 700, 26, Ui.semibold) + " começa às " + hhmm.format(new Date(p.start)));
-                }, first);
+                Target t = target("g:" + row + ":" + p.start, rowId, r3, 14, () -> pickProgram(ch, p), first);
                 if (t != null && t.key.equals(focusKey) && guideSel != p) {
                     guideSel = p;
-                    guideSelChannel = ch.number;
+                    guideSelChannel = ch;
                     if (c != null) postInvalidate();
                 }
+            }
+            if (!any) {
+                r3.set(gx + 4, y + 8, gx + gw - 4, y + 88);
+                text(c, "Sem informação de programação", r3.left + 20, r3.centerY() + 9, 24, Ui.regular, neu.muted, 0);
+                target("g:" + row + ":x", rowId, r3, 14, () -> tuneChannel(ch), false);
             }
             if (c != null && nowX >= gx && nowX <= gx + gw) {
                 fill.setColor(neu.accent);
@@ -676,42 +870,77 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             }
             y += 96 + 12;
         }
+        if (!guideFromTv) {
+            text(c, "Grade nacional de cada rede: os programas locais das afiliadas de Curitiba podem variar.",
+                    W - PAD, CONTENT_BOTTOM + 4, 22, Ui.regular, neu.muted, 2);
+        }
     }
 
-    private void loadGuide() {
-        if (!Guide.allowed(getContext()) || guideLoading) {
-            invalidate();
+    private void pickProgram(Guide.Channel ch, Guide.Program p) {
+        long now = System.currentTimeMillis();
+        if (p.start <= now && now < p.end) {
+            tuneChannel(ch);
             return;
         }
+        boolean on = Reminders.toggle(getContext(), ch, p);
+        if (on) allowOverlay();
+        showToast(on ? "Lembrete às " + hhmm.format(new Date(p.start - 60_000L)) + ": " + p.title : "Lembrete removido");
+    }
+
+    /** The reminder's banner draws over other apps: allowed once through the TV's own ADB (Original takes it back). */
+    private void allowOverlay() {
+        if (Settings.canDrawOverlays(getContext())) return;
+        final Context ctx = getContext().getApplicationContext();
+        io.execute(() -> {
+            try (Adb adb = Adb.connect(ctx, 30_000, null)) {
+                adb.shell("appops set " + HomeMode.PKG + " SYSTEM_ALERT_WINDOW allow");
+            } catch (Exception e) {
+                AppLog.w("reminders: overlay not allowed: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Loads the guide: the TV's own, where it shares it (and we may read it), else the one from the internet. Without
+     * `force` only when the copy in memory is older than 8 hours (or there is none).
+     */
+    private void loadGuide(boolean force) {
+        if (guideLoading) return;
+        if (!force && guide != null && System.currentTimeMillis() - guideAt < NetGuide.KEEP_MS && !guide.channels.isEmpty()) return;
         guideLoading = true;
         Calendar cal = Calendar.getInstance();
         cal.set(Calendar.SECOND, 0);
         cal.set(Calendar.MILLISECOND, 0);
         cal.set(Calendar.MINUTE, cal.get(Calendar.MINUTE) < 30 ? 0 : 30);
-        final long from = cal.getTimeInMillis(), to = from + GUIDE_SPAN_MIN * 60_000L;
+        final long from = cal.getTimeInMillis(), to = from + 24 * 3600_000L;
         final Context ctx = getContext().getApplicationContext();
         invalidate();
         io.execute(() -> {
-            final Guide.Result r = Guide.read(ctx, from, to);
+            Guide.Result r = null;
+            boolean tv = false;
+            if (Guide.allowed(ctx)) {
+                r = Guide.read(ctx, from, to);
+                tv = r.programCount > 0;
+            }
+            if (!tv) r = NetGuide.read(ctx, from, to);
+            final Guide.Result result = r;
+            final boolean fromTv = tv;
             handler.post(() -> {
-                guide = r;
+                guide = result;
+                guideFromTv = fromTv;
                 guideFrom = from;
+                guideAt = System.currentTimeMillis();
                 guideLoading = false;
                 guideSel = null;
-                focusFirst = screen == GUIDE;
+                if (screen == GUIDE) focusFirst = true;
                 invalidate();
             });
         });
     }
 
-    private void askGuide() {
-        activity.requestPermissions(Guide.permissions(), 7);
-    }
-
     // MARK: Gerenciador
 
     private void tasksScreen(Canvas c) {
-        // Memory and storage
         r1.set(PAD, CONTENT_TOP, PAD + 520, CONTENT_BOTTOM);
         if (c != null) {
             neu.raised(c, r1, 32, Neu.RAISED, 0);
@@ -736,25 +965,23 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             neu.raised(c, r2, 38, Neu.RAISED_SMALL, neu.accent);
             text(c, "Liberar memória", r2.centerX(), r2.centerY() + 10, 28, Ui.semibold, neu.onAccent, 1);
         }
-        target("free", r2, 38, this::askFreeMemory, true);
+        target("free", "L/free", r2, 38, this::askFreeMemory, true);
         // Open apps
         r1.set(PAD + 520 + 32, CONTENT_TOP, W - PAD, CONTENT_BOTTOM);
         if (c != null) {
             neu.raised(c, r1, 32, Neu.RAISED, 0);
             text(c, "Apps abertos", r1.left + 40, r1.top + 60, 32, Ui.semibold, neu.text, 0);
-            text(c, "Memória", r1.right - 40 - 210 - 24 - 380, r1.top + 60, 24, Ui.regular, neu.muted, 0);
         }
         r2.set(r1.right - 40 - 210, r1.top + 22, r1.right - 40, r1.top + 80);
         if (c != null) {
             neu.raised(c, r2, 29, Neu.RAISED_SMALL, 0);
             text(c, tasksLoading ? "Lendo…" : "Atualizar", r2.centerX(), r2.centerY() + 9, 24, Ui.semibold, neu.text, 1);
         }
-        target("refresh", r2, 29, this::loadTasks, false);
+        target("refresh", "R/refresh", r2, 29, this::loadTasks, false);
         float y = r1.top + 104;
         if (taskApps == null) {
             String msg = tasksError != null ? tasksError : "Lendo os apps abertos…";
-            String[] lines = wrap(msg, r1.width() - 80, 26, Ui.regular, 4);
-            for (String line : lines) {
+            for (String line : wrap(msg, r1.width() - 80, 26, Ui.regular, 4)) {
                 text(c, line, r1.left + 40, y + 40, 26, Ui.regular, neu.muted, 0);
                 y += 38;
             }
@@ -790,7 +1017,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
                     neu.raised(c, r3, 30, Neu.RAISED_SMALL, 0);
                     text(c, "Encerrar", r3.centerX(), r3.centerY() + 9, 24, Ui.semibold, neu.danger, 1);
                 }
-                target("end:" + a.pkg, r3, 30, () -> askStop(a), false);
+                target("end:" + a.pkg, "R/" + shown, r3, 30, () -> askStop(a), false);
             }
             y += 88 + 12;
             shown++;
@@ -851,23 +1078,40 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     private void askFreeMemory() {
         confirm("Liberar memória?",
                 "Fecha os apps em segundo plano. O que você está vendo ou ouvindo continua aberto.",
-                "Liberar", () -> {
-                    final Context ctx = getContext().getApplicationContext();
-                    final long before = Tasks.memory(ctx).available;
-                    io.execute(() -> {
-                        String done;
-                        try {
-                            Tasks.freeMemory(ctx);
-                            Thread.sleep(1200);
-                            long gained = Tasks.memory(ctx).available - before;
-                            done = gained > 1_048_576 ? Tasks.size(gained) + " liberados" : "Nada a liberar agora";
-                        } catch (Exception e) {
-                            done = "Não consegui liberar: aceite a depuração na TV";
-                        }
-                        final String msg = done;
-                        handler.post(() -> { showToast(msg); loadTasks(); });
-                    });
-                });
+                "Liberar", () -> freeMemory(true));
+    }
+
+    private void freeMemory(final boolean asked) {
+        final Context ctx = getContext().getApplicationContext();
+        final long before = Tasks.memory(ctx).available;
+        autoFreeAt = System.currentTimeMillis();
+        io.execute(() -> {
+            String done;
+            try {
+                Tasks.freeMemory(ctx);
+                Thread.sleep(1200);
+                long gained = Tasks.memory(ctx).available - before;
+                done = gained > 1_048_576 ? "Memória liberada: " + Tasks.size(gained) : asked ? "Nada a liberar agora" : null;
+            } catch (Exception e) {
+                done = asked ? "Não consegui liberar: aceite a depuração na TV" : null;
+            }
+            final String msg = done;
+            handler.post(() -> {
+                if (msg != null) showToast(msg);
+                mem = Tasks.memory(getContext());
+                if (asked) loadTasks();
+                invalidate();
+            });
+        });
+    }
+
+    /** Back on the home screen with little memory free (and the option on): closes what runs in the background. */
+    private void maybeFreeMemory() {
+        if (!autoFree || mem == null || mem.total == 0) return;
+        long now = System.currentTimeMillis();
+        if (now - autoFreeAt < AUTO_FREE_EVERY && now >= autoFreeAt) return;
+        if (mem.available / (double) mem.total > 0.15) return;
+        freeMemory(false);
     }
 
     // MARK: Ajustes
@@ -878,26 +1122,27 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         String[] names = {"Aparência", "Tela inicial", "TV"};
         for (int i = 0; i < 3; i++) {
             r2.set(r1.left + 28, r1.top + 28 + i * 96, r1.right - 28, r1.top + 108 + i * 96);
-            final int s = i;
             if (c != null) {
                 neu.raised(c, r2, 22, Neu.RAISED_SMALL, sub == i ? neu.accent : 0);
                 text(c, names[i], r2.left + 28, r2.centerY() + 10, 28, Ui.semibold, sub == i ? neu.onAccent : neu.text, 0);
             }
-            target("sub" + i, r2, 22, () -> { sub = s; invalidate(); }, sub == i);
+            target("sub" + i, "N/" + i, r2, 22, () -> move(1, 0), sub == i);
         }
         r2.set(r1.left + 28, r1.bottom - 220, r1.right - 28, r1.bottom - 28);
         if (c != null) {
             neu.inset(c, r2, 22, neu.bg);
-            String[] lines = wrap("Rede, contas, atualizações e o resto ficam no menu da TV", r2.width() - 40, 24, Ui.regular, 3);
             float y = r2.top + 40;
-            for (String l : lines) { text(c, l, r2.left + 20, y, 24, Ui.regular, neu.muted, 0); y += 32; }
+            for (String l : wrap("Rede, contas, atualizações e o resto ficam no menu da TV", r2.width() - 40, 24, Ui.regular, 3)) {
+                text(c, l, r2.left + 20, y, 24, Ui.regular, neu.muted, 0);
+                y += 32;
+            }
         }
         r3.set(r2.left + 20, r2.bottom - 88, r2.right - 20, r2.bottom - 20);
         if (c != null) {
             neu.raised(c, r3, 34, Neu.RAISED_SMALL, 0);
             text(c, "Configurações da TV", r3.centerX(), r3.centerY() + 9, 24, Ui.semibold, neu.text, 1);
         }
-        target("native", r3, 34, this::openTvSettings, false);
+        target("native", "N/native", r3, 34, this::openTvSettings, false);
 
         r1.set(PAD + 400 + 32, CONTENT_TOP, W - PAD, CONTENT_BOTTOM);
         if (c != null) neu.raised(c, r1, 32, Neu.RAISED, 0);
@@ -916,7 +1161,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
                     text(c, themes[i][1], r2.centerX(), r2.top + 44, 26, Ui.semibold, on ? neu.onAccent : neu.text, 1);
                     text(c, themes[i][2], r2.centerX(), r2.top + 76, 22, Ui.regular, on ? neu.onAccent : neu.muted, 1);
                 }
-                target("theme:" + id, r2, 24, () -> setTheme(id), false);
+                target("theme:" + id, "C/theme", r2, 24, () -> setTheme(id), false);
             }
             y += 96 + 52;
             text(c, "Cor de destaque", x, y, 28, Ui.semibold, neu.text, 0);
@@ -934,7 +1179,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
                     if (on) check(c, r2.centerX(), r2.top + 38, 13, neu.onAccent);
                     text(c, Neu.ACCENT_NAMES[i], r2.centerX(), r2.bottom - 16, 22, on ? Ui.semibold : Ui.regular, on ? neu.text : neu.muted, 1);
                 }
-                target("accent:" + i, r2, 22, () -> setAccent(col), false);
+                target("accent:" + i, "C/sw" + row, r2, 22, () -> setAccent(col), false);
             }
             y += 2 * 124 + 36;
             text(c, "Prévia", x, y, 28, Ui.semibold, neu.text, 0);
@@ -945,14 +1190,21 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             y = toggle(c, x, y, w, "Previsão do tempo", "weather", showWeather);
             y = toggle(c, x, y, w, "Memória e armazenamento", "system", showSystem);
             y = toggle(c, x, y, w, "Últimos lançamentos", "releases", showReleases);
-            y += 20;
+            y = toggle(c, x, y, w, "Liberar memória sozinho ao voltar ao Início (quando falta)", "autofree", autoFree);
+            y = actionRow(c, x, y, w, "Apps ocultos", hidden.isEmpty() ? "Nenhum app oculto em Todos os apps" : hidden.size() + " oculto(s) em Todos os apps",
+                    "Escolher", false, () -> openAllApps(true));
             y = actionRow(c, x, y, w, "Chave do TMDB, cidade e outros ajustes", "Abre os ajustes do Free My TV", "Abrir", false, this::openFreeMyTvSettings);
-            actionRow(c, x, y, w, "Tela original da TCL", "Desliga esta tela e devolve a de fábrica, do jeito que era. Nada é apagado.", "Voltar à original", true, this::openFreeMyTvSettings);
+            actionRow(c, x, y, w, "Tela original da TCL", "Desliga esta tela e devolve a de fábrica. Nada é apagado.", "Voltar à original", true, this::openFreeMyTvSettings);
         } else {
-            text(c, "Imagem, som, entradas e rede", x, y, 28, Ui.semibold, neu.text, 0);
+            text(c, "Ajustes rápidos", x, y, 28, Ui.semibold, neu.text, 0);
             y += 24;
-            y = actionRow(c, x, y, w, "Todas as configurações da TV", "Abre o menu da própria TV, com o visual dela.", "Abrir", false, this::openTvSettings);
-            text(c, "Os ajustes rápidos de imagem e som chegam na próxima versão.", x, y + 20, 24, Ui.regular, neu.muted, 0);
+            int left = SleepTimer.minutesLeft(getContext());
+            y = actionRow(c, x, y, w, "Desligar sozinha", left == 0 ? "Desligado  ·  OK escolhe 30 min, 1 h ou 2 h" : "Desliga em " + SleepTimer.duration(left),
+                    left == 0 ? "Ligar" : "Mudar", false, this::stepSleep);
+            final Intent picture = TvPages.picture(getContext()), sound = TvPages.sound(getContext());
+            if (picture != null) y = actionRow(c, x, y, w, "Imagem", "Modo de imagem, brilho e cores, na tela da própria TV", "Abrir", false, () -> openIntent(picture));
+            if (sound != null) y = actionRow(c, x, y, w, "Som", "Modo de som e saída de áudio, na tela da própria TV", "Abrir", false, () -> openIntent(sound));
+            actionRow(c, x, y, w, "Todas as configurações da TV", "Rede, contas, entradas e atualizações", "Abrir", false, this::openTvSettings);
         }
     }
 
@@ -960,7 +1212,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         r2.set(x, y, x + w, y + 96);
         if (c != null) {
             neu.inset(c, r2, 22, neu.bg);
-            text(c, label, r2.left + 28, r2.centerY() + 10, 26, Ui.semibold, neu.text, 0);
+            text(c, ellipsize(label, w - 240, 26, Ui.semibold), r2.left + 28, r2.centerY() + 10, 26, Ui.semibold, neu.text, 0);
         }
         r3.set(r2.right - 24 - 156, r2.centerY() - 32, r2.right - 24, r2.centerY() + 32);
         if (c != null) {
@@ -970,27 +1222,27 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             c.drawCircle(kx, r3.centerY(), 26, fill);
             text(c, on ? "LIG" : "DESL", on ? r3.left + 24 : r3.right - 24, r3.centerY() + 9, 24, Ui.semibold, on ? neu.onAccent : neu.muted, on ? 0 : 2);
         }
-        target("tg:" + key, r3, 32, () -> setShow(key, !on), false);
-        return y + 96 + 16;
+        target("tg:" + key, "C/tg:" + key, r3, 32, () -> setShow(key, !on), false);
+        return y + 96 + 14;
     }
 
     private float actionRow(Canvas c, float x, float y, float w, String title, String body, String button, boolean danger, Runnable run) {
-        r2.set(x, y, x + w, y + 120);
+        r2.set(x, y, x + w, y + 104);
         tp.setTypeface(Ui.semibold);
         tp.setTextSize(24);
         float bw = tp.measureText(button) + 64;
         if (c != null) {
             neu.inset(c, r2, 22, neu.bg);
-            text(c, title, r2.left + 28, r2.top + 48, 26, Ui.semibold, neu.text, 0);
-            text(c, ellipsize(body, w - bw - 80, 24, Ui.regular), r2.left + 28, r2.top + 86, 24, Ui.regular, neu.muted, 0);
+            text(c, title, r2.left + 28, r2.top + 42, 26, Ui.semibold, neu.text, 0);
+            text(c, ellipsize(body, w - bw - 80, 24, Ui.regular), r2.left + 28, r2.top + 78, 24, Ui.regular, neu.muted, 0);
         }
         r3.set(r2.right - 24 - bw, r2.centerY() - 32, r2.right - 24, r2.centerY() + 32);
         if (c != null) {
             neu.raised(c, r3, 32, Neu.RAISED_SMALL, danger ? 0 : neu.accent);
             text(c, button, r3.centerX(), r3.centerY() + 9, 24, Ui.semibold, danger ? neu.danger : neu.onAccent, 1);
         }
-        target("act:" + title, r3, 32, run, false);
-        return y + 120 + 16;
+        target("act:" + title, "C/act:" + title, r3, 32, run, false);
+        return y + 104 + 14;
     }
 
     private void preview(Canvas c, float x, float y, float w) {
@@ -1013,48 +1265,82 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         ring(c, x + 760, cy, 46, 14, 0.25f, "25%", 22);
     }
 
+    /** Off → 30 min → 1 h → 2 h → off: the next step after what's left. */
+    private void stepSleep() {
+        int left = SleepTimer.minutesLeft(getContext()), next = 0;
+        for (int s : SLEEP_STEPS) if (s > left) { next = s; break; }
+        SleepTimer.set(getContext(), next);
+        showToast(next == 0 ? "Desligar sozinha: desligado" : "A TV desliga em " + SleepTimer.duration(next));
+    }
+
     // MARK: Todos os apps
 
     private void allAppsScreen(Canvas c) {
-        text(c, "Todos os apps", PAD, CONTENT_TOP + 30, 32, Ui.semibold, neu.text, 0);
-        if (allApps.isEmpty()) {
-            text(c, "Carregando…", PAD, CONTENT_TOP + 90, 26, Ui.regular, neu.muted, 0);
+        text(c, editHidden ? "Apps ocultos: OK esconde ou mostra" : "Todos os apps", PAD, CONTENT_TOP + 30, 32, Ui.semibold, neu.text, 0);
+        if (editHidden) {
+            tp.setTypeface(Ui.semibold);
+            tp.setTextSize(24);
+            float bw = tp.measureText("Pronto") + 80;
+            r1.set(W - PAD - bw, CONTENT_TOP - 4, W - PAD, CONTENT_TOP + 56);
+            if (c != null) {
+                neu.raised(c, r1, 30, Neu.RAISED_SMALL, neu.accent);
+                text(c, "Pronto", r1.centerX(), r1.centerY() + 9, 24, Ui.semibold, neu.onAccent, 1);
+            }
+            target("done", "aa-top", r1, 30, () -> { editHidden = false; openScreen(SETTINGS); }, false);
+        }
+        List<String[]> list = visibleApps();
+        if (list.isEmpty()) {
+            text(c, allApps.isEmpty() ? "Carregando…" : "Todos os apps estão ocultos", PAD, CONTENT_TOP + 110, 26, Ui.regular, neu.muted, 0);
             return;
         }
-        int cols = 6, rows = 4;
-        float cw = (W - 2 * PAD - (cols - 1) * 24) / cols, ch = 172, top = CONTENT_TOP + 70;
-        allMaxTop = Math.max(0, (allApps.size() + cols - 1) / cols - rows);
+        float cw = (W - 2 * PAD - (APP_COLS - 1) * 24) / APP_COLS, ch = 172, top = CONTENT_TOP + 80;
+        allMaxTop = Math.max(0, (list.size() + APP_COLS - 1) / APP_COLS - APP_ROWS);
         allTop = Math.max(0, Math.min(allTop, allMaxTop));
-        for (int i = allTop * cols; i < Math.min(allApps.size(), (allTop + rows) * cols); i++) {
-            final String[] app = allApps.get(i);
-            int row = i / cols - allTop, col = i % cols;
+        for (int i = allTop * APP_COLS; i < Math.min(list.size(), (allTop + APP_ROWS) * APP_COLS); i++) {
+            final String[] app = list.get(i);
+            int row = i / APP_COLS - allTop, col = i % APP_COLS;
+            boolean off = hidden.contains(app[0]);
             r1.set(PAD + col * (cw + 24), top + row * (ch + 24), PAD + col * (cw + 24) + cw, top + row * (ch + 24) + ch);
             if (c != null) {
-                neu.raised(c, r1, 26, Neu.RAISED_SMALL, 0);
+                if (off) neu.inset(c, r1, 26, 0); else neu.raised(c, r1, 26, Neu.RAISED_SMALL, 0);
                 Drawable d = icons.get(app[0]);
                 if (d != null) {
                     d.setBounds((int) (r1.centerX() - 40), (int) (r1.top + 22), (int) (r1.centerX() + 40), (int) (r1.top + 102));
+                    d.setAlpha(off ? 90 : 255);
                     d.draw(c);
                 }
-                text(c, ellipsize(app[1], cw - 24, 24, Ui.semibold), r1.centerX(), r1.bottom - 24, 24, Ui.semibold, neu.text, 1);
+                text(c, ellipsize(off ? "Oculto · " + app[1] : app[1], cw - 24, 24, Ui.semibold), r1.centerX(), r1.bottom - 24, 24,
+                        Ui.semibold, off ? neu.muted : neu.text, 1);
             }
-            target("a:" + app[0], r1, 26, () -> {
-                HomeApps.Item it = HomeApps.app(app[0], app[1]);
-                openItem(it);
-            }, i == allTop * cols && focusFirst);
+            target("a:" + app[0], "aa" + (i / APP_COLS), r1, 26, () -> {
+                if (editHidden) toggleHidden(app[0]);
+                else openItem(HomeApps.app(app[0], app[1]));
+            }, i == allTop * APP_COLS);
         }
     }
 
-    private void openAllApps() {
-        screen = ALL_APPS;
-        allTop = 0;
-        focusFirst = true;
+    private List<String[]> visibleApps() {
+        if (editHidden) return allApps;
+        List<String[]> out = new ArrayList<>();
+        for (String[] a : allApps) if (!hidden.contains(a[0])) out.add(a);
+        return out;
+    }
+
+    private void toggleHidden(String pkg) {
+        if (!hidden.remove(pkg)) hidden.add(pkg);
+        prefs.edit().putStringSet("hidden", new HashSet<>(hidden)).apply();
         invalidate();
+    }
+
+    private void openAllApps(boolean edit) {
+        editHidden = edit;
+        allTop = 0;
+        openScreen(ALL_APPS);
         final Context ctx = getContext().getApplicationContext();
         io.execute(() -> {
             final List<String[]> list = HomeApps.launchable(ctx);
-            java.util.Collections.sort(list, (a, b) -> a[1].compareToIgnoreCase(b[1]));
-            final java.util.Map<String, Drawable> found = new java.util.HashMap<>();
+            Collections.sort(list, (a, b) -> a[1].compareToIgnoreCase(b[1]));
+            final Map<String, Drawable> found = new HashMap<>();
             PackageManager pm = ctx.getPackageManager();
             for (String[] a : list) {
                 try {
@@ -1066,10 +1352,109 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
                 allApps = list;
                 icons.clear();
                 icons.putAll(found);
-                focusFirst = screen == ALL_APPS;
+                if (screen == ALL_APPS) focusFirst = true;
                 invalidate();
             });
         });
+    }
+
+    // MARK: Volume
+
+    private void openVolume() {
+        if (audio == null) return;
+        volumeMax = Math.max(1, audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+        volume = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+        muted = audio.isStreamMute(AudioManager.STREAM_MUSIC);
+        volumeOpen = true;
+        focusBeforeModal = focusKey;
+        focusKey = "v:up";
+        armVolume();
+        invalidate();
+    }
+
+    private final Runnable closeVolume = () -> {
+        if (!volumeOpen) return;
+        volumeOpen = false;
+        focusKey = focusBeforeModal;
+        invalidate();
+    };
+
+    private void armVolume() {
+        handler.removeCallbacks(closeVolume);
+        handler.postDelayed(closeVolume, VOLUME_CLOSE_MS);
+    }
+
+    private void stepVolume(int dir) {
+        if (audio == null) return;
+        int step = Math.max(1, Math.round(volumeMax / 50f));   // TCL's 100 steps: 2 a press, as the remote does
+        volume = Math.max(0, Math.min(volumeMax, audio.getStreamVolume(AudioManager.STREAM_MUSIC) + dir * step));
+        if (muted) {
+            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0);
+            muted = false;
+        }
+        audio.setStreamVolume(AudioManager.STREAM_MUSIC, volume, 0);
+        armVolume();
+        invalidate();
+    }
+
+    private void toggleMute() {
+        if (audio == null) return;
+        audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, muted ? AudioManager.ADJUST_UNMUTE : AudioManager.ADJUST_MUTE, 0);
+        muted = audio.isStreamMute(AudioManager.STREAM_MUSIC);
+        armVolume();
+        invalidate();
+    }
+
+    private void volumePanel(Canvas c) {
+        inModal = true;
+        r1.set(W - PAD - 260, 200, W - PAD, 980);
+        float cx = r1.centerX();
+        if (c != null) {
+            neu.raised(c, r1, 44, Neu.RAISED, 0);
+            speaker(c, cx - 50, r1.top + 54, neu.muted, muted);
+            text(c, "Volume", cx - 22, r1.top + 63, 24, Ui.semibold, neu.muted, 0);
+            text(c, muted ? "Mudo" : String.valueOf(Math.round(volume * 100f / volumeMax)), cx, r1.top + 140, 56, Ui.displaySemibold, neu.text, 1);
+        }
+        r2.set(cx - 49, r1.top + 172, cx + 49, r1.top + 240);
+        if (c != null) {
+            neu.raised(c, r2, 22, Neu.RAISED_SMALL, 0);
+            text(c, "+", r2.centerX(), r2.centerY() + 14, 40, Ui.semibold, neu.text, 1);
+        }
+        target("v:up", "v/up", r2, 22, () -> stepVolume(1), true);
+        // The level, on a vertical rail
+        float railTop = r1.top + 262, railBottom = r1.top + 492;
+        if (c != null) {
+            r3.set(cx - 14, railTop, cx + 14, railBottom);
+            neu.inset(c, r3, 14, 0);
+            float v = muted ? 0 : volume / (float) volumeMax;
+            r3.top = railBottom - Math.max(28, (railBottom - railTop) * v);
+            fill.setColor(muted ? neu.muted : neu.accent);
+            c.drawRoundRect(r3, 14, 14, fill);
+            r4.set(cx - 24, r3.top - 10, cx + 24, r3.top + 38);
+            neu.raised(c, r4, 24, Neu.RAISED_SMALL, 0);
+        }
+        r2.set(cx - 49, railBottom + 22, cx + 49, railBottom + 90);
+        if (c != null) {
+            neu.raised(c, r2, 22, Neu.RAISED_SMALL, 0);
+            text(c, "−", r2.centerX(), r2.centerY() + 14, 40, Ui.semibold, neu.text, 1);
+        }
+        target("v:down", "v/down", r2, 22, () -> stepVolume(-1), false);
+        r2.set(r1.left + 28, railBottom + 112, r1.right - 28, railBottom + 176);
+        if (c != null) {
+            neu.raised(c, r2, 32, Neu.RAISED_SMALL, muted ? neu.accent : 0);
+            text(c, muted ? "Tirar do mudo" : "Sem som", r2.centerX(), r2.centerY() + 9, 24, Ui.semibold, muted ? neu.onAccent : neu.text, 1);
+        }
+        target("v:mute", "v/mute", r2, 32, this::toggleMute, false);
+        r2.set(r1.left + 28, railBottom + 196, r1.right - 28, railBottom + 260);
+        if (c != null) {
+            neu.raised(c, r2, 32, Neu.RAISED_SMALL, 0);
+            text(c, "Som da TV", r2.centerX(), r2.centerY() + 9, 24, Ui.semibold, neu.text, 1);
+        }
+        target("v:tv", "v/tv", r2, 32, () -> {
+            closeVolume.run();
+            Intent sound = TvPages.sound(getContext());
+            if (sound != null) openIntent(sound); else openTvSettings();
+        }, false);
     }
 
     // MARK: Confirm dialog
@@ -1103,7 +1488,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         float y = r1.top + 48 + 36;
         if (c != null) {
             neu.raised(c, r1, 36, Neu.RAISED, 0);
-            text(c, cTitle, r1.left + 48, y, 36, Ui.semibold, neu.text, 0);
+            text(c, ellipsize(cTitle, 724, 36, Ui.semibold), r1.left + 48, y, 36, Ui.semibold, neu.text, 0);
         }
         y += 18;
         for (String l : lines) {
@@ -1121,9 +1506,9 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             neu.raised(c, r2, 36, Neu.RAISED_SMALL, neu.danger);
             text(c, cOk, r2.centerX(), r2.centerY() + 9, 26, Ui.semibold, neu.onDanger, 1);
         }
-        target("c:cancel", r3, 36, () -> { closeConfirm(); invalidate(); }, true);
+        target("c:cancel", "c/buttons", r3, 36, () -> { closeConfirm(); invalidate(); }, true);
         final Runnable run = cRun;
-        target("c:ok", r2, 36, () -> { closeConfirm(); if (run != null) run.run(); invalidate(); }, false);
+        target("c:ok", "c/buttons", r2, 36, () -> { closeConfirm(); if (run != null) run.run(); invalidate(); }, false);
     }
 
     private void showToast(String text) {
@@ -1139,16 +1524,40 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
 
     private void openTab(int tab) {
         if (screen == tab) return;
-        screen = tab;
-        focusFirst = true;
-        if (tab == GUIDE) loadGuide();
+        openScreen(tab);
+        if (tab == GUIDE) loadGuide(false);
         if (tab == TASKS) loadTasks();
+    }
+
+    private void openScreen(int s) {
+        screen = s;
+        String back = screenMemory.get(s);
+        if (back != null) {
+            focusKey = back;
+            focusFirst = false;
+        } else {
+            focusFirst = true;
+        }
+        rowMemory.put("hdr", "tab" + (s == ALL_APPS || s == WEATHER ? HOME : s));
         invalidate();
     }
 
     private void openItem(HomeApps.Item it) {
         click.open();
+        if (it.kind == HomeApps.APP && it.pkg != null) {
+            prefs.edit().putInt("use:" + it.pkg, prefs.getInt("use:" + it.pkg, 0) + 1).apply();
+        }
         if (!HomeApps.open(getContext(), it, null)) showToast("Não consegui abrir " + it.label);
+    }
+
+    private void openIntent(Intent intent) {
+        click.open();
+        try {
+            getContext().startActivity(new Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        } catch (ActivityNotFoundException | SecurityException e) {
+            AppLog.w("couldn't open " + intent + ": " + e.getMessage());
+            showToast("A TV não deixou abrir essa tela");
+        }
     }
 
     private void openPick(Recs.Pick p) {
@@ -1163,30 +1572,44 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         openItem(it);
     }
 
-    private void openChannel(Guide.Channel ch) {
-        click.open();
-        try {
-            Intent view = new Intent(Intent.ACTION_VIEW, TvContract.buildChannelUri(ch.id)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            getContext().startActivity(view);
-        } catch (ActivityNotFoundException | SecurityException e) {
-            AppLog.w("guide: couldn't open channel " + ch.number + ": " + e.getMessage());
-            openLiveTv();
+    /**
+     * A channel: the TV's own entry when the guide came from the TV; otherwise live TV opens and the channel's number
+     * is typed on the remote's digits through the TV's own ADB (12.1 → "12": the TV tunes the first of its channels).
+     */
+    private void tuneChannel(Guide.Channel ch) {
+        prefs.edit().putString("lastCh", ch.number).apply();
+        if (ch.id >= 0) {
+            click.open();
+            try {
+                getContext().startActivity(new Intent(Intent.ACTION_VIEW, TvContract.buildChannelUri(ch.id)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                return;
+            } catch (ActivityNotFoundException | SecurityException e) {
+                AppLog.w("guide: couldn't open channel " + ch.number + ": " + e.getMessage());
+            }
         }
+        openLiveTv();
+        final String major = ch.number.contains(".") ? ch.number.substring(0, ch.number.indexOf('.')) : ch.number;
+        final Context ctx = getContext().getApplicationContext();
+        io.execute(() -> {
+            try {
+                Thread.sleep(2500);   // the TV app opening on its last channel
+                StringBuilder keys = new StringBuilder("input keyevent");
+                for (char d : major.toCharArray()) if (Character.isDigit(d)) keys.append(' ').append(7 + (d - '0'));
+                try (Adb adb = Adb.connect(ctx, 30_000, null)) {
+                    adb.shell(keys.toString());
+                }
+            } catch (Exception e) {
+                AppLog.w("guide: couldn't tune " + ch.number + ": " + e.getMessage());
+            }
+        });
     }
 
     private void openTvSettings() {
-        click.open();
-        try {
-            getContext().startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-        } catch (ActivityNotFoundException e) {
-            showToast("Não consegui abrir as configurações da TV");
-        }
+        openIntent(new Intent(Settings.ACTION_SETTINGS));
     }
 
     private void openFreeMyTvSettings() {
-        click.open();
-        getContext().startActivity(new Intent().setComponent(new ComponentName(getContext(), SettingsActivity.class))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        openIntent(new Intent().setComponent(new ComponentName(getContext(), SettingsActivity.class)));
     }
 
     private void setTheme(String id) {
@@ -1208,6 +1631,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         if ("weather".equals(key)) showWeather = on;
         if ("system".equals(key)) showSystem = on;
         if ("releases".equals(key)) showReleases = on;
+        if ("autofree".equals(key)) autoFree = on;
         invalidate();
     }
 
@@ -1219,23 +1643,49 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             return code == KeyEvent.KEYCODE_BACK || code == KeyEvent.KEYCODE_ESCAPE || isOk(code) || isArrow(code);
         }
         if (e.getAction() != KeyEvent.ACTION_DOWN) return false;
-        switch (code) {
-            case KeyEvent.KEYCODE_BACK:
-            case KeyEvent.KEYCODE_ESCAPE:
-                if (cTitle != null) closeConfirm();
-                else if (screen == ALL_APPS) { screen = HOME; focusKey = "allapps"; }
-                else if (screen != HOME) { screen = HOME; focusFirst = true; }
-                invalidate();
+        if (volumeOpen) armVolume();
+        if (code == KeyEvent.KEYCODE_BACK || code == KeyEvent.KEYCODE_ESCAPE) {
+            if (e.getRepeatCount() > 0) return true;
+            if (cTitle != null) closeConfirm();
+            else if (volumeOpen) closeVolume.run();
+            else if (screen == ALL_APPS && editHidden) { editHidden = false; openScreen(SETTINGS); }
+            else if (screen == ALL_APPS) { openScreen(HOME); focusKey = "allapps"; focusFirst = false; }
+            else if (screen == WEATHER) { openScreen(HOME); focusKey = "wx"; focusFirst = false; }
+            else if (screen != HOME) openScreen(HOME);
+            invalidate();
+            return true;
+        }
+        if (isArrow(code)) {
+            // One press, one step: a held key moves at a steady pace, and a second press of the same key within
+            // 50 ms of the first (a remote that sends a press twice) is dropped.
+            long now = SystemClock.uptimeMillis();
+            long gap = now - lastKeyAt;
+            if (e.getRepeatCount() > 0 ? gap < 160 : code == lastKey && gap < 50) return true;
+            lastKey = code;
+            lastKeyAt = now;
+            // Volume panel: ← → change the volume wherever the focus is
+            if (volumeOpen && (code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT)) {
+                stepVolume(code == KeyEvent.KEYCODE_DPAD_RIGHT ? 1 : -1);
                 return true;
-            case KeyEvent.KEYCODE_DPAD_UP: move(0, -1); return true;
-            case KeyEvent.KEYCODE_DPAD_DOWN: move(0, 1); return true;
-            case KeyEvent.KEYCODE_DPAD_LEFT: move(-1, 0); return true;
-            case KeyEvent.KEYCODE_DPAD_RIGHT: move(1, 0); return true;
-            default: break;
+            }
+            switch (code) {
+                case KeyEvent.KEYCODE_DPAD_UP: move(0, -1); break;
+                case KeyEvent.KEYCODE_DPAD_DOWN: move(0, 1); break;
+                case KeyEvent.KEYCODE_DPAD_LEFT: move(-1, 0); break;
+                default: move(1, 0); break;
+            }
+            return true;
         }
         if (isOk(code)) {
-            if (e.getRepeatCount() > 0) return true;
             Target t = focused();
+            if (e.getRepeatCount() > 0) {
+                // Held OK on + or −: the volume keeps going
+                if (volumeOpen && t != null && t.action != null && ("v:up".equals(t.key) || "v:down".equals(t.key))) {
+                    long now = SystemClock.uptimeMillis();
+                    if (now - lastKeyAt >= 160) { lastKeyAt = now; t.action.run(); }
+                }
+                return true;
+            }
             if (t != null && t.action != null) t.action.run();
             invalidate();
             return true;
@@ -1253,9 +1703,23 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
     }
 
     private Target focused() {
-        if (focusKey == null) return null;
-        for (int i = 0; i < count; i++) if (focusKey.equals(pool.get(i).key)) return pool.get(i);
+        return byKey(focusKey);
+    }
+
+    private Target byKey(String key) {
+        if (key == null) return null;
+        for (int i = 0; i < count; i++) if (key.equals(pool.get(i).key)) return pool.get(i);
         return null;
+    }
+
+    private void setFocus(Target t) {
+        focusKey = t.key;
+        rowMemory.put(t.row, t.key);
+        groupMemory.put(t.group, t.key);
+        if (!modal && !"hdr".equals(t.group)) screenMemory.put(screen, t.key);
+        if (screen == SETTINGS && t.key.startsWith("sub") && sub != t.key.charAt(3) - '0') {
+            sub = t.key.charAt(3) - '0';   // the menu shows its page as the focus passes
+        }
     }
 
     private void move(int dx, int dy) {
@@ -1265,59 +1729,124 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             invalidate();
             return;
         }
-        float cx = cur.r.centerX(), cy = cur.r.centerY();
-        Target best = null;
-        float bestScore = Float.MAX_VALUE;
-        for (int i = 0; i < count; i++) {
-            Target t = pool.get(i);
-            if (t == cur) continue;
-            float tx = t.r.centerX() - cx, ty = t.r.centerY() - cy;
-            float main = dx != 0 ? tx * dx : ty * dy;
-            if (main <= 4) continue;
-            // Across: how far the target is from overlapping our row (or column), not just its center.
-            float across = dx != 0 ? gap(cur.r.top, cur.r.bottom, t.r.top, t.r.bottom)
-                    : gap(cur.r.left, cur.r.right, t.r.left, t.r.right);
-            float score = main + across * 3 + (dx != 0 ? Math.abs(ty) : Math.abs(tx)) * 0.3f;
-            if (score < bestScore) { bestScore = score; best = t; }
-        }
-        if (best == null) {
-            // Lists that scroll: the guide's channels and all the apps.
-            if (screen == GUIDE && guide != null && dy != 0 && cur.key.startsWith("g:")) {
-                int next = guideTop + dy;
-                if (next >= 0 && next <= guide.channels.size() - GUIDE_ROWS) {
-                    guideTop = next;
-                    pendingX = cx;
-                    pendingDir = dy;
-                    click.move();
-                    invalidate();
-                }
-            } else if (screen == ALL_APPS && dy != 0 && cur.key.startsWith("a:")) {
-                int next = allTop + dy;
-                if (next >= 0 && next <= allMaxTop) {
-                    allTop = next;
-                    pendingX = cx;
-                    pendingDir = dy;
-                    click.move();
-                    invalidate();
-                }
-            }
-            return;
-        }
-        focusKey = best.key;
+        Target next = dx != 0 ? sideways(cur, dx) : vertical(cur, dy);
+        if (next == null) return;
+        setFocus(next);
         click.move();
         invalidate();
     }
 
-    private static float gap(float a0, float a1, float b0, float b1) {
-        if (b1 < a0) return a0 - b1;
-        if (b0 > a1) return b0 - a1;
-        return 0;
+    /** ← →: the neighbor in the row; at its end, the nearest item beside it in another row (a side menu, a panel). */
+    private Target sideways(Target cur, int dx) {
+        Target best = null;
+        float bestD = Float.MAX_VALUE;
+        for (int i = 0; i < count; i++) {
+            Target t = pool.get(i);
+            if (t == cur || !t.row.equals(cur.row)) continue;
+            float d = (t.r.centerX() - cur.r.centerX()) * dx;
+            if (d > 4 && d < bestD) { bestD = d; best = t; }
+        }
+        if (best != null) return best;
+        // Beside: overlapping our height first, nearest edge; then anything ahead. A group's last item wins.
+        for (int pass = 0; pass < 2 && best == null; pass++) {
+            for (int i = 0; i < count; i++) {
+                Target t = pool.get(i);
+                if (t.row.equals(cur.row) || "hdr".equals(t.group) != "hdr".equals(cur.group) || !ahead(cur, t, dx)) continue;
+                if (pass == 0 && overlap(cur.r.top, cur.r.bottom, t.r.top, t.r.bottom) <= 0) continue;
+                float d = (dx > 0 ? t.r.left - cur.r.right : cur.r.left - t.r.right) + Math.abs(t.r.centerY() - cur.r.centerY()) * 0.5f;
+                if (d < bestD) { bestD = d; best = t; }
+            }
+        }
+        if (best != null && !best.group.equals(cur.group)) {
+            Target remembered = byKey(groupMemory.get(best.group));
+            if (remembered != null && remembered.group.equals(best.group) && ahead(cur, remembered, dx)) return remembered;
+        }
+        return best;
+    }
+
+    private static boolean ahead(Target cur, Target t, int dx) {
+        return dx > 0 ? t.r.left >= cur.r.right - 8 : t.r.right <= cur.r.left + 8;
+    }
+
+    /** ↑ ↓: the next row in the same group (the one under first), else the header; the row's last item, else the one under. */
+    private Target vertical(Target cur, int dy) {
+        if (dy > 0 && "hdr".equals(cur.group)) {
+            Target back = byKey(screenMemory.get(screen));
+            if (back != null) return back;
+            for (int i = 0; i < count; i++) if (pool.get(i).first) return pool.get(i);
+            for (int i = 0; i < count; i++) if (!"hdr".equals(pool.get(i).group)) return pool.get(i);
+            return null;
+        }
+        String row = nearestRow(cur, dy, true, true);
+        if (row == null && scroll(cur, dy)) return null;
+        if (row == null) row = nearestRow(cur, dy, true, false);
+        if (row == null && !modal) row = nearestRow(cur, dy, false, true);
+        if (row == null && dy < 0 && !modal) row = "hdr";
+        if (row == null) return null;
+        // The row's last item, except in grids (the guide, all the apps), where the column wins
+        Target remembered = byKey(rowMemory.get(row));
+        if (remembered != null && remembered.row.equals(row) && !scrolls(remembered)) return remembered;
+        // The one under: coming from something wider (a big card), the first it covers; else the most covered
+        Target best = null;
+        float bestScore = -Float.MAX_VALUE;
+        for (int i = 0; i < count; i++) {
+            Target t = pool.get(i);
+            if (!t.row.equals(row)) continue;
+            float o = overlap(cur.r.left, cur.r.right, t.r.left, t.r.right);
+            float score;
+            if (o > 0) score = cur.r.width() > t.r.width() * 1.5f ? 100_000 - t.r.left : 100_000 + o;
+            else score = -Math.abs(t.r.centerX() - cur.r.centerX());
+            if (score > bestScore) { bestScore = score; best = t; }
+        }
+        return best;
+    }
+
+    /** The nearest row above (dy < 0) or below: in our group or another, overlapping our width or not. */
+    private String nearestRow(Target cur, int dy, boolean sameGroup, boolean overlapping) {
+        String best = null;
+        float bestGap = Float.MAX_VALUE;
+        for (int i = 0; i < count; i++) {
+            Target t = pool.get(i);
+            if (t.row.equals(cur.row) || "hdr".equals(t.group)) continue;
+            if (sameGroup != t.group.equals(cur.group)) continue;
+            boolean ahead = dy > 0 ? t.r.top >= cur.r.bottom - 8 : t.r.bottom <= cur.r.top + 8;
+            if (!ahead) continue;
+            if (overlapping && overlap(cur.r.left, cur.r.right, t.r.left, t.r.right) <= 0) continue;
+            float gap = dy > 0 ? t.r.top - cur.r.bottom : cur.r.top - t.r.bottom;
+            if (gap < bestGap) { bestGap = gap; best = t.row; }
+        }
+        return best;
+    }
+
+    /** At the edge of a list that scrolls (the guide's channels, all the apps): the next one comes in. */
+    private boolean scroll(Target cur, int dy) {
+        if (!scrolls(cur)) return false;
+        if (screen == GUIDE && guide != null) {
+            int next = guideTop + dy;
+            if (next < 0 || next > guide.channels.size() - GUIDE_ROWS) return false;
+            guideTop = next;
+        } else if (screen == ALL_APPS) {
+            int next = allTop + dy;
+            if (next < 0 || next > allMaxTop) return false;
+            allTop = next;
+        } else {
+            return false;
+        }
+        pendingX = cur.r.centerX();
+        pendingDir = dy;
+        click.move();
+        invalidate();
+        return true;
+    }
+
+    private static float overlap(float a0, float a1, float b0, float b1) {
+        return Math.min(a1, b1) - Math.max(a0, b0);
     }
 
     // MARK: - Focus targets
 
-    private Target target(String key, RectF r, float radius, Runnable action, boolean first) {
-        if (modal && !inModal) return null;   // a dialog is open: only its buttons take the focus
+    private Target target(String key, String row, RectF r, float radius, Runnable action, boolean first) {
+        if (modal && !inModal) return null;   // a dialog or the volume is open: only its buttons take the focus
         Target t;
         if (count < pool.size()) t = pool.get(count);
         else {
@@ -1326,6 +1855,9 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         }
         count++;
         t.key = key;
+        t.row = row;
+        int slash = row.indexOf('/');
+        t.group = "hdr".equals(row) ? "hdr" : slash > 0 ? row.substring(0, slash) : "main";
         t.r.set(r);
         t.radius = radius;
         t.action = action;
@@ -1401,9 +1933,11 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         if (c != null) {
             neu.raised(c, r1, 36, Neu.RAISED, 0);
             text(c, title, r1.centerX(), r1.top + 100, 36, Ui.semibold, neu.text, 1);
-            String[] lines = wrap(body, r1.width() - 120, 26, Ui.regular, 3);
             float y = r1.top + 160;
-            for (String l : lines) { text(c, l, r1.centerX(), y, 26, Ui.regular, neu.muted, 1); y += 38; }
+            for (String l : wrap(body, r1.width() - 120, 26, Ui.regular, 3)) {
+                text(c, l, r1.centerX(), y, 26, Ui.regular, neu.muted, 1);
+                y += 38;
+            }
         }
         if (button == null) return;
         tp.setTypeface(Ui.semibold);
@@ -1414,7 +1948,7 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
             neu.raised(c, r2, 38, Neu.RAISED_SMALL, neu.accent);
             text(c, button, r2.centerX(), r2.centerY() + 10, 28, Ui.semibold, neu.onAccent, 1);
         }
-        target("msg", r2, 38, action, true);
+        target("msg", "msg", r2, 38, action, true);
     }
 
     private void ring(Canvas c, float cx, float cy, float radius, float thick, float value, String label, float size) {
@@ -1453,6 +1987,32 @@ final class NeuView extends View implements HomeData.Listener, Recs.Listener {
         path.close();
         fill.setColor(color);
         c.drawPath(path, fill);
+    }
+
+    private void speaker(Canvas c, float cx, float cy, int color, boolean off) {
+        path.reset();
+        path.moveTo(cx - 14, cy - 5);
+        path.lineTo(cx - 7, cy - 5);
+        path.lineTo(cx + 2, cy - 13);
+        path.lineTo(cx + 2, cy + 13);
+        path.lineTo(cx - 7, cy + 5);
+        path.lineTo(cx - 14, cy + 5);
+        path.close();
+        fill.setColor(color);
+        c.drawPath(path, fill);
+        stroke.setColor(color);
+        stroke.setStrokeWidth(2.6f);
+        stroke.setStrokeCap(Paint.Cap.ROUND);
+        if (off) {
+            c.drawLine(cx + 8, cy - 6, cx + 18, cy + 6, stroke);
+            c.drawLine(cx + 18, cy - 6, cx + 8, cy + 6, stroke);
+        } else {
+            r3.set(cx - 2, cy - 8, cx + 12, cy + 8);
+            c.drawArc(r3, -55, 110, false, stroke);
+            r3.set(cx - 4, cy - 15, cx + 20, cy + 15);
+            c.drawArc(r3, -55, 110, false, stroke);
+        }
+        stroke.setStrokeCap(Paint.Cap.BUTT);
     }
 
     private void check(Canvas c, float cx, float cy, float r, int color) {

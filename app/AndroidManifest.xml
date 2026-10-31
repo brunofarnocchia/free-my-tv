@@ -62,6 +62,8 @@
         <package android:name="net.cme.voyo.cz.tvapp" />
         <package android:name="com.spotify.tv.android" />
         <package android:name="com.tcl.tv" />
+        <package android:name="com.tcl.settings" />
+        <package android:name="com.android.tv.settings" />
         <package android:name="com.google.android.tv" />
         <package android:name="com.mediatek.wwtv.tvcenter" />
         <package android:name="com.sony.dtv.tvx" />

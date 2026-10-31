@@ -1,0 +1,32 @@
+# The TV guide of Curitiba's free-to-air channels (tools/guia_br.py), every 8 hours, as guia.json on the "guia" release.
+# The TV downloads it from there and throws its copy away after 8 hours (NetGuide).
+name: Grade da TV
+
+on:
+  schedule:
+    - cron: "17 2,10,18 * * *"
+  push:
+    branches: [main]
+    paths: ["tools/guia_br.py", ".github/workflows/guide.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: guide
+  cancel-in-progress: false
+
+jobs:
+  guide:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 tools/guia_br.py guia.json
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view guia > /dev/null 2>&1 || gh release create guia --target "$GITHUB_SHA" --prerelease \
+            --title "Grade da TV (Curitiba)" --notes "Atualizada a cada 8 horas. A TV baixa daqui."
+          gh release upload guia guia.json --clobber

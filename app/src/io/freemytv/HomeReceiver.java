@@ -21,6 +21,9 @@ public class HomeReceiver extends BroadcastReceiver {
             later(() -> Updates.cleanUp(context));
         } else if (Updates.ACTION.equals(action)) {
             later(() -> Updates.status(context, intent));
+        } else if (Reminders.ACTION.equals(action)) {
+            PendingResult result = goAsync();   // the banner stays 9 s
+            Reminders.fire(context, intent, result::finish);
         } else if (SleepTimer.ACTION.equals(action)) {
             long setAt = intent.getLongExtra("setAt", 0);
             later(() -> SleepTimer.fire(context, setAt));   // ADB is network

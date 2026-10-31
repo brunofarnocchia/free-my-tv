@@ -26,8 +26,14 @@ code. `Neu` draws its shadows as cached nine-slice masks; `Guide` reads the ante
 memory and stopping them through the TV's own ADB). Its text is Portuguese only, written in the code (no `Ui.tr`).
 `.github/workflows/apk.yml` builds it with his settings on every push to `main` and publishes the `tv-tcl` release,
 signed with the key in the repository's secrets (`FREEMYTV_KEYSTORE_B64`, `FREEMYTV_KEYSTORE_PASS`).
-Keep it light: no animations, nothing running while another app is in front. Volume stays the TV's own (no key
-filter on TCL's Android 11).
+Focus moves by rows (each target has a row and a group: header, side menu, content; ↑ ↓ land on the row's last
+item, or the one under). The guide: TCL keeps the antenna's guide to itself, so `NetGuide` downloads `guia.json` from
+the `guia` release (`tools/guia_br.py`, run every 8 hours by `.github/workflows/guide.yml`, from meuguia.tv's national
+guides mapped to Curitiba's channel numbers) and throws its copy away after 8 hours; a program on air tunes by typing
+its number through the TV's own ADB, a later one sets a reminder (`Reminders`: an exact alarm, then a banner over
+other apps). `TvPages` finds TCL's picture and sound pages. The volume panel (top icon) uses AudioManager.
+Keep it light: no animations, nothing running while another app is in front. The remote's volume keys stay the
+TV's own (no key filter on TCL's Android 11).
 
 ## Always
 
