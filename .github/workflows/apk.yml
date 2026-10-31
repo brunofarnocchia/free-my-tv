@@ -1,0 +1,79 @@
+# Builds Bruno's TV app (TCL 32S5400AF, Curitiba) and publishes it as the "tv-tcl" release, replacing the last one.
+# Signed with the key in the repository's secrets, so every build installs over the previous one on the TV.
+name: APK da TV
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**", "build.sh", ".github/workflows/apk.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Android SDK (build-tools 34, android-34)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$RUNNER_TEMP/sdk" \
+            "build-tools;34.0.0" "platforms;android-34" > /dev/null
+          echo "ANDROID_HOME=$RUNNER_TEMP/sdk" >> "$GITHUB_ENV"
+      # No secrets here: the TMDB key is typed on the TV (Ajustes > Tela inicial > Abrir).
+      - name: Settings
+        run: |
+          cat > config.properties <<'EOF'
+          tmdb_region=BR
+          latitude=-25.4284
+          longitude=-49.2733
+          city=Curitiba
+          language=pt
+          show_crypto=false
+          currency=BRL
+          temperature=C
+          theme=auto
+          disable_assistant=true
+          disable_chromecast=true
+          screensaver=false
+          EOF
+          sed -i 's/^ *//' config.properties
+      - name: Version
+        run: |
+          sed -i -E "s/android:versionCode=\"[0-9]+\"/android:versionCode=\"$((1000 + GITHUB_RUN_NUMBER))\"/; \
+            s/android:versionName=\"[^\"]+\"/android:versionName=\"1.2-tcl.$GITHUB_RUN_NUMBER\"/" app/AndroidManifest.xml
+          grep -E "versionCode|versionName" app/AndroidManifest.xml
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.FREEMYTV_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Add the FREEMYTV_KEYSTORE_B64 and FREEMYTV_KEYSTORE_PASS secrets (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/tv.keystore"
+          echo "FREEMYTV_KEYSTORE=$RUNNER_TEMP/tv.keystore" >> "$GITHUB_ENV"
+      - name: Build
+        env:
+          FREEMYTV_KEYSTORE_PASS: ${{ secrets.FREEMYTV_KEYSTORE_PASS }}
+        run: ./build.sh
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete tv-tcl --yes --cleanup-tag || true
+          gh release create tv-tcl FreeMyTV.apk --target "$GITHUB_SHA" --title "TV TCL (build $GITHUB_RUN_NUMBER)" \
+            --notes "Instalar: adb connect <IP da TV>:5555 e adb install -r FreeMyTV.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FreeMyTV
+          path: FreeMyTV.apk

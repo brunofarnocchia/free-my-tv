@@ -16,6 +16,19 @@ call that fails there.
 The person you're helping may not be technical. Keep it short and friendly, say what you're about to do on their TV
 before you do it, and let them do the taps on the TV.
 
+## This fork (Bruno's TCL 32S5400AF)
+
+Bruno's own TV: TCL 32S5400AF, Android TV 11, MediaTek MT5867, 0.9 GB RAM, 3.4 GB storage, UI at 1280×720, in
+Curitiba, Brazilian Portuguese. `HomeActivity` shows `NeuView` (a soft "neumorphic" design: Início, Programação,
+Gerenciador and Ajustes; light, dark or automatic theme; 12 accent colors) instead of `HomeView`, which stays in the
+code. `Neu` draws its shadows as cached nine-slice masks; `Guide` reads the antenna's guide from Android's TV provider
+(READ_EPG_DATA and READ_TV_LISTINGS, asked on the TV); `Tasks` is the task manager (memory from Android, the apps'
+memory and stopping them through the TV's own ADB). Its text is Portuguese only, written in the code (no `Ui.tr`).
+`.github/workflows/apk.yml` builds it with his settings on every push to `main` and publishes the `tv-tcl` release,
+signed with the key in the repository's secrets (`FREEMYTV_KEYSTORE_B64`, `FREEMYTV_KEYSTORE_PASS`).
+Keep it light: no animations, nothing running while another app is in front. Volume stays the TV's own (no key
+filter on TCL's Android 11).
+
 ## Always
 
 - Google TV's setup app (`setupwraith`) goes off before the stock home screen and comes back after it, everywhere

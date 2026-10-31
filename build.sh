@@ -56,6 +56,7 @@ else
   CURRENCY="$(prop currency USD)"
 fi
 ASSIST=false; [ "$(prop disable_assistant false)" = "true" ] && ASSIST=true
+CAST=false; [ "$(prop disable_chromecast false)" = "true" ] && CAST=true
 CRYPTO=false; [ "$(prop show_crypto true)" = "true" ] && CRYPTO=true
 ANIMATION=false; [ "$(prop hide_animation false)" = "true" ] && ANIMATION=true
 SAVER=true; [ "$(prop screensaver true)" = "false" ] && SAVER=false
@@ -82,6 +83,7 @@ final class Config {
     static final String HIDE_SERVICES = "$(prop hide_services '')";
     static final String THEME = "$(prop theme auto)";
     static final boolean DISABLE_ASSISTANT = $ASSIST;
+    static final boolean DISABLE_CHROMECAST = $CAST;   // false: casting from a phone stays on
     static final boolean SHOW_CRYPTO = $CRYPTO;
     static final boolean HIDE_ANIMATION = $ANIMATION;
     static final boolean SCREENSAVER = $SAVER;   // false: the TV keeps its own

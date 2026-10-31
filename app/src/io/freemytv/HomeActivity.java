@@ -18,7 +18,7 @@ import android.widget.TextView;
 public class HomeActivity extends Activity {
     /** Opens All Apps (a remote's All Apps button, RemoteKeys). */
     static final String EXTRA_ALL_APPS = "io.freemytv.ALL_APPS";
-    private HomeView home;
+    private NeuView home;
     private int prefsVersion = Prefs.version;   // settings changed while we were away: start over
 
     @Override protected void onCreate(Bundle savedInstanceState) {
@@ -39,7 +39,7 @@ public class HomeActivity extends Activity {
             return;
         }
         Ui.init(this);
-        home = new HomeView(this);
+        home = new NeuView(this);
         setContentView(home);
         getWindow().setBackgroundDrawable(null);
         if (getIntent().getBooleanExtra(EXTRA_ALL_APPS, false)) home.showAllApps();
@@ -71,12 +71,17 @@ public class HomeActivity extends Activity {
         super.onNewIntent(intent);
         if (home == null) return;
         if (intent.getBooleanExtra(EXTRA_ALL_APPS, false)) home.showAllApps();
-        else home.reset(true);
+        else home.reset();
     }
 
     @Override protected void onDestroy() {
         if (home != null) home.destroy();
         super.onDestroy();
+    }
+
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (home != null) home.permissionsResult();
     }
 
     @Override public void onTrimMemory(int level) {

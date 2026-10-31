@@ -102,6 +102,9 @@ final class HomeMode {
     /** The voice assistant, only with disable_assistant=true in config.properties (the mic button stops working). */
     static final String[] ASSISTANT = {"com.google.android.katniss", "com.android.hotwordenrollment.okgoogle"};
 
+    /** Chromecast built-in (casting from a phone), only with disable_chromecast=true; otherwise it stays protected. */
+    static final String[] CHROMECAST = {"com.google.android.apps.mediashell"};
+
     /** Never turned off, not even by mistake (picture, sound, inputs, remote, store). Checked before every disable. */
     private static final Set<String> PROTECTED = new HashSet<>(Arrays.asList(
         "com.tcl.ttvs", "com.tvos", "com.tcl.systemserver", "com.tcl.systemui.plugin", "com.tcl.tv", "com.tcl.tvinput",
@@ -194,7 +197,8 @@ final class HomeMode {
 
     /** Checked before every disable: never the protected list, Amazon's packages, Android's own pieces or a factory menu. */
     private static boolean mayTurnOff(String pkg) {
-        return !PROTECTED.contains(pkg) && !pkg.startsWith("com.amazon.")
+        boolean chosen = Config.DISABLE_CHROMECAST && Arrays.asList(CHROMECAST).contains(pkg);
+        return (chosen || !PROTECTED.contains(pkg)) && !pkg.startsWith("com.amazon.")
                 && !CORE.matcher(pkg).matches() && !FACTORY.matcher(pkg).matches();
     }
 
@@ -495,7 +499,8 @@ final class HomeMode {
             String home = originalHome(s);
             Set<String> toEnable = new HashSet<>(stringList(s, "disabled"));
             for (String pkg : targets(home, originalDream(s), true)) {
-                if (!Arrays.asList(DEBLOAT).contains(pkg) && !Arrays.asList(ASSISTANT).contains(pkg)) toEnable.add(pkg);
+                if (!Arrays.asList(DEBLOAT).contains(pkg) && !Arrays.asList(ASSISTANT).contains(pkg)
+                        && !Arrays.asList(CHROMECAST).contains(pkg)) toEnable.add(pkg);
             }
             toEnable.removeAll(stringList(s, "keptOff"));
             Set<String> present = packages(adb, "");
@@ -819,6 +824,7 @@ final class HomeMode {
         if (Config.SCREENSAVER && dreamPkg != null && !dreamPkg.equals(PKG) && !dreamPkg.equals(homePkg)) out.add(dreamPkg);
         out.addAll(Arrays.asList(DEBLOAT));
         if (Config.DISABLE_ASSISTANT) out.addAll(Arrays.asList(ASSISTANT));
+        if (Config.DISABLE_CHROMECAST) out.addAll(Arrays.asList(CHROMECAST));
         return out;
     }
 
